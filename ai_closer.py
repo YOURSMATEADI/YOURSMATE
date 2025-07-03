@@ -9,6 +9,24 @@ from typing import Dict, Optional
 
 import requests
 
+# Optional third-party helpers
+try:
+    from nameparser import HumanName  # type: ignore
+except ImportError:  # pragma: no cover
+    HumanName = None  # type: ignore
+
+try:
+    from twilio.rest import Client as TwilioClient  # type: ignore
+except ImportError:  # pragma: no cover
+    TwilioClient = None  # type: ignore
+
+try:
+    import sendgrid  # type: ignore
+    from sendgrid.helpers.mail import Mail
+except ImportError:  # pragma: no cover
+    sendgrid = None  # type: ignore
+    Mail = None  # type: ignore
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -22,6 +40,17 @@ FREE_DEMO_LINK: str = os.getenv(
 )
 
 FOLLOW_UP_DELAY_SECONDS = 60 * 60  # 1 hour
+
+# SMS / Email / Notification
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
+TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+
+SENDGRID_API_KEY = os.getenv("SENDGRID_API_KEY")
+SENDGRID_FROM_EMAIL = os.getenv("SENDGRID_FROM_EMAIL")
+
+# Internal notification (e.g., Slack webhook) for new leads
+NOTIFICATION_WEBHOOK_URL = os.getenv("NOTIFICATION_WEBHOOK_URL")
 
 # ---------------------------------------------------------------------------
 # Conversation State Machine
@@ -48,6 +77,9 @@ class Lead:
     company: Optional[str] = None
     revenue: Optional[str] = None
     target_demos: Optional[str] = None
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    lead_score: Optional[int] = None  # Calculated later
 
     def to_dict(self) -> Dict[str, str]:
         return {
@@ -55,6 +87,9 @@ class Lead:
             "company": self.company or "",
             "revenue": self.revenue or "",
             "targetDemos": self.target_demos or "",
+            "email": self.email or "",
+            "phone": self.phone or "",
+            "leadScore": str(self.lead_score or ""),
         }
 
 
@@ -71,6 +106,10 @@ class Conversation:
     # ---------------------------------------------------------------------
 
     def _log_to_crm(self, payload: Dict[str, str]) -> None:
+        # Ensure leadScore is present
+        if "leadScore" not in payload and self.lead.lead_score is not None:
+            payload["leadScore"] = str(self.lead.lead_score)
+
         if not CRM_WEBHOOK_URL:
             # Skip if not configured (development mode)
             print("[debug] CRM webhook URL not set. Skipping log.")
@@ -132,20 +171,49 @@ class Conversation:
     # ------------------------------------------------------------------
 
     def _parse_company_role(self, text: str) -> None:
-        """Very naive extraction of name + company from free-form answer."""
-        # Expect formats like "I'm John, CEO at Acme Corp" or "Acme Corp – VP Marketing John"
-        name_match = re.search(r"i(?:'|\s)?m\s+([A-Z][a-z]+)", text, re.I)
-        if name_match:
-            self.lead.name = name_match.group(1)
-        # Extract company (looking for capitalised words followed by Corp/Inc/etc or proper case words)
-        company_match = re.search(r"at\s+([A-Z][\w &]+)", text)
-        if company_match:
-            self.lead.company = company_match.group(1).strip()
-        else:
-            # fallback: take first two title-cased words
+        """Attempt to extract name, company, email & phone from free-form answer."""
+
+        # ---------------- Email & phone first ---------------- #
+        email_match = re.search(r"[\w\.-]+@[\w\.-]+\.[a-z]{2,}", text, re.I)
+        if email_match:
+            self.lead.email = email_match.group(0)
+
+        phone_match = re.search(r"(\+?\d[\d \-()]{7,}\d)", text)
+        if phone_match:
+            self.lead.phone = re.sub(r"[^0-9+]", "", phone_match.group(0))
+
+        # ---------------- Name extraction -------------------- #
+        if not self.lead.name:
+            # Look for "I'm <name>" or "I am <name>" etc.
+            name_pattern = re.search(
+                r"(?:i\s*am|i'm|my\s*name\s*is)\s+([A-Z][A-Za-z\s\-']{1,40})",
+                text,
+                re.I,
+            )
+            if name_pattern:
+                raw_name = name_pattern.group(1).strip()
+                if HumanName:
+                    self.lead.name = HumanName(raw_name).first
+                else:
+                    self.lead.name = raw_name.split()[0]
+
+        # ---------------- Company extraction ----------------- #
+        if not self.lead.company:
+            company_pattern = re.search(
+                r"(?:at|from|with|for|of)\s+([A-Z][\w &]+(?:\s(?:Inc|Corp|LLC|Ltd|Group|Labs|Systems|Technologies))?)",
+                text,
+            )
+            if company_pattern:
+                self.lead.company = company_pattern.group(1).strip()
+
+        # Fallback heuristics if still missing
+        if not self.lead.company:
+            # pick sequence of 2-3 title-cased words that isn't the extracted name
             tokens = [t for t in text.split() if t.istitle()]
             if len(tokens) >= 2:
-                self.lead.company = " ".join(tokens[:2])
+                guess = " ".join(tokens[:3])
+                if guess.lower() != (self.lead.name or "").lower():
+                    self.lead.company = guess
 
     def _present_solution(self) -> str:
         similar_company = self.lead.company or "a similar company"
@@ -153,6 +221,8 @@ class Conversation:
             f"We've helped {similar_company} add 500+ qualified leads/mo using our AI Sales "
             "Bot—built in 48 hrs."
         )
+        # Compute lead score before logging
+        self.lead.lead_score = self._compute_lead_score()
         # Send to CRM now that we have major info
         self._log_to_crm({
             **self.lead.to_dict(),
@@ -208,8 +278,123 @@ class Conversation:
                 "event": "follow_up_sent",
                 "timestamp": int(time.time()),
             })
+            # Send actual follow-up via SMS/Email if possible
+            self._send_sms_email_followup(follow_up)
+            # Notify internal team of new lead
+            self._send_new_lead_notification()
             return follow_up
         return None
+
+    # ---------------------- Lead intelligence --------------------------
+
+    def _compute_lead_score(self) -> int:
+        """Very simple heuristic scoring based on revenue & targets."""
+        score = 0
+        # Revenue buckets
+        rev_num = self._normalize_number(self.lead.revenue)
+        if rev_num is not None:
+            if rev_num >= 1_000_000:
+                score += 50
+            elif rev_num >= 500_000:
+                score += 30
+            elif rev_num >= 100_000:
+                score += 15
+            else:
+                score += 5
+
+        # Target demos
+        demos_num = self._normalize_number(self.lead.target_demos)
+        if demos_num is not None:
+            if demos_num >= 100:
+                score += 50
+            elif demos_num >= 50:
+                score += 30
+            elif demos_num >= 20:
+                score += 15
+            else:
+                score += 5
+
+        # Could add more factors (industry fit, etc.)
+        return score
+
+    @staticmethod
+    def _normalize_number(text: Optional[str]) -> Optional[float]:
+        if not text:
+            return None
+        cleaned = text.lower().replace(",", "").strip()
+        match = re.search(r"([0-9]*\.?[0-9]+)", cleaned)
+        if not match:
+            return None
+        num = float(match.group(1))
+        if "k" in cleaned:
+            num *= 1_000
+        elif "m" in cleaned:
+            num *= 1_000_000
+        return num
+
+    # -------------------- Communication helpers ---------------------- #
+
+    def _send_sms_email_followup(self, body: str) -> None:
+        """Try to send SMS and email follow-ups using configured providers."""
+        # SMS via Twilio
+        if (
+            self.lead.phone
+            and TwilioClient
+            and TWILIO_ACCOUNT_SID
+            and TWILIO_AUTH_TOKEN
+            and TWILIO_FROM_NUMBER
+        ):
+            try:
+                client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                client.messages.create(
+                    to=self.lead.phone, from_=TWILIO_FROM_NUMBER, body=body
+                )
+            except Exception as e:
+                print(f"[error] Failed to send SMS follow-up: {e}")
+
+        # Email via SendGrid
+        if (
+            self.lead.email
+            and sendgrid
+            and Mail
+            and SENDGRID_API_KEY
+            and SENDGRID_FROM_EMAIL
+        ):
+            try:
+                sg = sendgrid.SendGridAPIClient(SENDGRID_API_KEY)
+                mail = Mail(
+                    from_email=SENDGRID_FROM_EMAIL,
+                    to_emails=self.lead.email,
+                    subject="Quick follow-up: free AI lead demo",
+                    plain_text_content=body,
+                )
+                sg.send(mail)
+            except Exception as e:
+                print(f"[error] Failed to send email follow-up: {e}")
+
+    # -------------------- Lead notifications ------------------------ #
+
+    def _send_new_lead_notification(self) -> None:
+        """Notify internal team via webhook when chat closes."""
+        if not NOTIFICATION_WEBHOOK_URL:
+            print("[debug] No notification webhook configured.")
+            return
+        payload = {**self.lead.to_dict(), "event": "new_lead", "timestamp": int(time.time())}
+        # Add quick context preview
+        payload["summary"] = (
+            f"{self.lead.name or 'Someone'} from {self.lead.company or '?'} – score "
+            f"{self.lead.lead_score or 'n/a'}"
+        )
+        try:
+            requests.post(NOTIFICATION_WEBHOOK_URL, json=payload, timeout=5)
+        except Exception as e:
+            print(f"[error] Failed to send new-lead notification: {e}")
+
+    def mark_closed(self) -> None:
+        """Explicitly close chat and fire new-lead notification."""
+        if self.stage != Stage.CLOSED:
+            self.stage = Stage.CLOSED
+        self._send_new_lead_notification()
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +412,7 @@ def _cli_chat():
             user_input = input("You: ")
         except (EOFError, KeyboardInterrupt):
             print("\n[session terminated]")
+            conv.mark_closed()
             break
         bot_reply = conv.on_user_message(user_input)
         print(f"Bot: {bot_reply}")
@@ -234,6 +420,7 @@ def _cli_chat():
         followup = conv.check_need_follow_up()
         if followup:
             print(f"Bot (follow-up): {followup}")
+            conv.mark_closed()
             break
 
 

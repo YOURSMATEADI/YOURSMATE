@@ -1,3 +1,6 @@
 streamlit
 pandas
 requests>=2.31.0
+twilio>=8.4.2
+sendgrid>=6.10.0
+nameparser>=1.1.3
